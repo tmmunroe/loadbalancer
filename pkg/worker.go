@@ -1,46 +1,56 @@
 package loadbalancer
 
 import (
+	"fmt"
 	"log"
 	"net"
 	"net/rpc"
+	"time"
 )
 
 type Worker struct {
-	Server *Server
+	Server    *Server
+	RegClient *rpc.Client
 }
 
-func InitWorker() *Worker {
+func InitWorker() (*Worker, error) {
 	a, _ := net.ResolveTCPAddr("tcp", "127.0.0.1:0")
+	_, regAddr := LoadBalancerAddresses()
+
 	s, e := InitServer(a)
 	if e != nil {
-		log.Printf("error initializing worker services: %v", e)
+		return nil, fmt.Errorf("error initializing worker services: %v", e)
 	}
 
-	w := &Worker{Server: s}
-	e = w.Server.AddService(w)
+	c, e := rpc.Dial(regAddr.Network(), regAddr.String())
 	if e != nil {
-		log.Printf("error registering worker services: %v", e)
+		return nil, fmt.Errorf("error dialing register: %v", e)
 	}
 
-	return w
+	w := &Worker{
+		Server:    s,
+		RegClient: c,
+	}
+
+	ws := &WorkerServices{}
+	e = w.Server.AddService(ws)
+	if e != nil {
+		w.RegClient.Close()
+		w.RegClient = nil
+		return nil, fmt.Errorf("error registering worker services: %v", e)
+	}
+
+	return w, nil
 }
 
 func (w *Worker) register() error {
-	_, regAddr := LoadBalancerAddresses()
-	c, e := rpc.Dial(regAddr.Network(), regAddr.String())
-	if e != nil {
-		log.Printf("error dialing register: %v", e)
-		return e
-	}
-
 	log.Printf("registering")
 	args := RegisterArgs{Address: w.Server.Address}
 	reply := RegisterReply{}
-	e = c.Call("Registration.Register", &args, &reply)
+
+	e := w.RegClient.Call("Registration.Register", &args, &reply)
 	if e != nil {
-		log.Printf("error registering: %v", e)
-		return e
+		return fmt.Errorf("error registering: %v", e)
 	}
 
 	return nil
@@ -48,6 +58,38 @@ func (w *Worker) register() error {
 
 func (w *Worker) listen() error {
 	return w.Server.Start()
+}
+
+func (w *Worker) healthCheck() error {
+	log.Printf("pinging load balancer...")
+	args := PingArgs{From: *w.Server.Address}
+	reply := PingReply{}
+
+	e := w.RegClient.Call("Registration.Ping", &args, &reply)
+	if e != nil {
+		return fmt.Errorf("error registering: %v", e)
+	}
+
+	log.Printf("ping complete...")
+	return nil
+}
+
+func (w *Worker) Loop() error {
+	w.Server.Running = true
+	step, _ := time.ParseDuration("5s")
+	for w.Server.Running {
+		time.Sleep(step)
+		log.Printf("Waiting...")
+		e := w.healthCheck()
+		if e != nil {
+			log.Printf("health check failed: %v", e)
+			w.Server.Running = false
+			return e
+		}
+	}
+
+	log.Printf("Stopped...")
+	return nil
 }
 
 func (w *Worker) Start() {
@@ -64,32 +106,5 @@ func (w *Worker) Start() {
 	}
 
 	log.Printf("looping indefinetly...")
-	w.Server.Loop()
-}
-
-func (w *Worker) Ping(args *PingArgs, reply *PingReply) error {
-	log.Printf("Received Ping %v", args)
-	return nil
-}
-
-func (w *Worker) Add(args *MathArgs, reply *MathReply) error {
-	log.Printf("Received Add %v", args)
-	res := 0.0
-	for _, x := range args.Numbers {
-		res += x
-	}
-	reply.Answer = res
-	log.Printf("Replying Add %v: %v", args, reply)
-	return nil
-}
-
-func (w *Worker) Multiply(args *MathArgs, reply *MathReply) error {
-	log.Printf("Received Multiply %v", args)
-	res := 0.0
-	for _, x := range args.Numbers {
-		res *= x
-	}
-	reply.Answer = res
-	log.Printf("Replying Multiply %v: %v", args, reply)
-	return nil
+	w.Loop()
 }

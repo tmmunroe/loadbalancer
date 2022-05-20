@@ -12,6 +12,7 @@ type Server struct {
 	Address  *net.TCPAddr
 	Listener net.Listener
 	Server   *rpc.Server
+	Running  bool
 }
 
 func InitServer(addr *net.TCPAddr) (*Server, error) {
@@ -38,10 +39,13 @@ func (s *Server) AddService(serv interface{}) error {
 
 func (s *Server) Loop() error {
 	step, _ := time.ParseDuration("5s")
-	for {
+	for s.Running {
 		time.Sleep(step)
 		log.Printf("Waiting...")
 	}
+
+	log.Printf("Stopped...")
+	return nil
 }
 
 func (s *Server) Start() error {

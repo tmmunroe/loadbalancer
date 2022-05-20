@@ -100,7 +100,7 @@ func (wh *WorkerHandle) healthCheck() error {
 	log.Printf("health check %v", wh.Address.String())
 	p := &PingArgs{From: *wh.Address}
 	r := &PingReply{}
-	call := wh.Client.Go("Worker.Ping", p, r, nil)
+	call := wh.Client.Go("WorkerServices.Ping", p, r, nil)
 	select {
 	case <-call.Done:
 		log.Printf("ping complete %v", wh.Address.String())
