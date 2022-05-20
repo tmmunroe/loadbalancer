@@ -14,11 +14,22 @@ type Server struct {
 	Server   *rpc.Server
 }
 
-func InitServer(addr *net.TCPAddr) *Server {
-	return &Server{
-		Address: addr,
-		Server:  rpc.NewServer(),
+func InitServer(addr *net.TCPAddr) (*Server, error) {
+	l, e := net.Listen(addr.Network(), addr.String())
+	if e != nil {
+		return nil, e
 	}
+
+	actualAddr, e := net.ResolveTCPAddr(l.Addr().Network(), l.Addr().String())
+	if e != nil {
+		return nil, e
+	}
+
+	return &Server{
+		Address:  actualAddr,
+		Listener: l,
+		Server:   rpc.NewServer(),
+	}, nil
 }
 
 func (s *Server) AddService(serv interface{}) error {
@@ -34,15 +45,7 @@ func (s *Server) Loop() error {
 }
 
 func (s *Server) Start() error {
-	log.Printf("Starting %v server %v %v...", s.Name, s.Address.Network(), s.Address.String())
-	l, e := net.Listen(s.Address.Network(), s.Address.String())
-	if e != nil {
-		return e
-	}
-
-	s.Listener = l
-	log.Printf("Accepting %v connections...", s.Name)
-	go s.Server.Accept(l)
-
+	log.Printf("Accepting %v connections...", s.Address)
+	go s.Server.Accept(s.Listener)
 	return nil
 }

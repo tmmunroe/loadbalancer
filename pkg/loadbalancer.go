@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"log"
 	"net"
-	"net/rpc"
 	"sync"
 	"time"
 )
@@ -14,10 +13,14 @@ type ServiceRequest struct {
 	Request interface{}
 	Reply   interface{}
 	Result  chan ServiceRequest
+	Timeout time.Duration
 }
 
 type MathServices struct {
 	Requests chan ServiceRequest
+
+	mu      sync.Mutex
+	Pending map[*net.TCPAddr]*ServiceRequest
 }
 
 type Registration struct {
@@ -32,7 +35,7 @@ type LoadBalancer struct {
 	ClientServer *Server
 	MathServices *MathServices
 
-	Done map[*net.TCPAddr]chan bool
+	WorkerPool *WorkerPool
 }
 
 func LoadBalancerAddresses() (*net.TCPAddr, *net.TCPAddr) {
@@ -44,6 +47,8 @@ func LoadBalancerAddresses() (*net.TCPAddr, *net.TCPAddr) {
 func InitMathService() *MathServices {
 	return &MathServices{
 		Requests: make(chan ServiceRequest, 100),
+		mu:       sync.Mutex{},
+		Pending:  make(map[*net.TCPAddr]*ServiceRequest),
 	}
 }
 
@@ -54,22 +59,32 @@ func InitRegistration() *Registration {
 	}
 }
 
-func InitLoadBalancer(addr *net.TCPAddr, registrationAddr *net.TCPAddr) *LoadBalancer {
-	s := InitServer(addr)
+func InitLoadBalancer(addr *net.TCPAddr, registrationAddr *net.TCPAddr) (*LoadBalancer, error) {
+	s, e := InitServer(addr)
+	if e != nil {
+		return nil, e
+	}
+
+	rs, e := InitServer(registrationAddr)
+	if e != nil {
+		return nil, e
+	}
+
 	m := InitMathService()
 	s.AddService(m)
 
-	rs := InitServer(registrationAddr)
 	r := InitRegistration()
 	rs.AddService(r)
+
+	wp := InitWorkerPool()
 
 	return &LoadBalancer{
 		RegistrationServer: rs,
 		Register:           r,
 		ClientServer:       s,
 		MathServices:       m,
-		Done:               make(map[*net.TCPAddr]chan bool),
-	}
+		WorkerPool:         wp,
+	}, nil
 }
 
 func (rs *Registration) Register(args *RegisterArgs, reply *RegisterReply) error {
@@ -89,42 +104,23 @@ func (rs *Registration) Report() string {
 	return fmt.Sprintf("Registration: %v", rs.Servers)
 }
 
-func (l *LoadBalancer) startServerManager(addr *net.TCPAddr, done chan bool) error {
-	log.Printf("starting server manager for %v", addr)
-	c, e := rpc.Dial(addr.Network(), addr.String())
-	if e != nil {
-		log.Printf("failed to connect to worker: %v", e)
-		return e
-	}
-
-	for {
-		log.Printf("waiting for requests to send to %v...", addr)
-		select {
-		case <-done:
-			return nil
-		case r := <-l.MathServices.Requests:
-			log.Printf("Serving request %v on server %v", addr, r)
-			e = c.Call(r.Method, r.Request, r.Reply)
-			if e != nil {
-				log.Printf("failed to call to worker: %v", e)
-				return e
-			}
-			log.Printf("Returning request %v on server %v", addr, r)
-			r.Result <- r
-		}
-	}
-}
-
-func (l *LoadBalancer) startServerManagers() {
+func (l *LoadBalancer) startWorkerHandles() {
 	l.Register.mu.Lock()
 	defer l.Register.mu.Unlock()
+
 	for _, a := range l.Register.Servers {
-		if _, e := l.Done[a]; e {
+		if _, e := l.WorkerPool.Handles[a]; e {
 			continue
 		}
 
-		l.Done[a] = make(chan bool, 1)
-		go l.startServerManager(a, l.Done[a])
+		frequency, _ := time.ParseDuration("10s")
+		timeout, _ := time.ParseDuration("10s")
+		handle, e := l.WorkerPool.AddWorkerHandle(a, l.MathServices.Requests, frequency, timeout)
+		if e != nil {
+			log.Panicf("could not add worker handle %v", a)
+		}
+
+		go handle.Run()
 	}
 }
 
@@ -134,7 +130,7 @@ func (l *LoadBalancer) Loop() error {
 		time.Sleep(step)
 		log.Printf("Requests: %v", len(l.MathServices.Requests))
 		log.Printf("Registered Servers: %v", l.Register.Report())
-		l.startServerManagers()
+		l.startWorkerHandles()
 	}
 }
 
@@ -153,7 +149,8 @@ func (l *LoadBalancer) Ping(args *PingArgs, reply *PingReply) error {
 func (l *MathServices) Add(args *MathArgs, reply *MathReply) error {
 	log.Printf("Received Add %v", args)
 	result := make(chan ServiceRequest)
-	sr := ServiceRequest{"Worker.Add", args, reply, result}
+	timeout, _ := time.ParseDuration("1m")
+	sr := ServiceRequest{"Worker.Add", args, reply, result, timeout}
 
 	log.Printf("Enqueueing Add %v", args)
 	l.Requests <- sr
@@ -171,7 +168,8 @@ func (l *MathServices) Add(args *MathArgs, reply *MathReply) error {
 func (l *MathServices) Multiply(args *MathArgs, reply *MathReply) error {
 	log.Printf("Received Multiply %v", args)
 	result := make(chan ServiceRequest)
-	sr := ServiceRequest{"Worker.Multiply", args, reply, result}
+	timeout, _ := time.ParseDuration("1m")
+	sr := ServiceRequest{"Worker.Multiply", args, reply, result, timeout}
 
 	log.Printf("Enqueueing Multiply %v", args)
 	l.Requests <- sr
